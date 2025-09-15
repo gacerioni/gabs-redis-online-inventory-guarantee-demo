@@ -1,40 +1,71 @@
 # Demo de Reserva de Inventário Online (Redis + Postgres, com CDC/RDI)
 
-Reservas lock-free e atômicas usando scripts Lua no Redis.  
-O Postgres é o *system of record* (SoR) do estoque (`inventory.total`) e dos pedidos.  
-O RDI/CDC replica automaticamente o campo `total` para o Redis (em `inv:{sku}.total`).  
-O app gerencia apenas `reserved` e `hold:*` no Redis.  
-Disponível = `total (PG/RDI)` – `reserved (Redis)`.
+Este projeto demonstra como implementar **reservas de inventário lock-free e atômicas** usando **scripts Lua no Redis**, com o **Postgres** como *system of record* (SoR) e o **RDI/CDC** garantindo convergência entre os dois mundos.
 
-## Como funciona (resumo)
-1) `/reserve`: script Lua valida `available = total - reserved`, cria hold com `expiresAt` e indexa no ZSET.  
-2) `/commit`: primeiro `UPDATE inventory.total` no PG; RDI replica `total` para Redis; então Lua faz `reserved--` e apaga o hold.  
-3) `/release`: Lua devolve `reserved--` e apaga hold.  
-4) Reaper: varre holds vencidos e chama release automático.  
-Sem loops: app nunca escreve `total` em Redis; RDI nunca toca `reserved`/`hold:*`.
+- **Postgres** mantém o estoque final (`inventory.total`) e os pedidos.  
+- **RDI/CDC** replica automaticamente o campo `total` para Redis (`inv:{sku}.total`).  
+- **Redis** gerencia apenas `reserved` e `hold:*`, calculando disponibilidade em tempo real:  
+  ```
+  available = total (PG/RDI) – reserved (Redis)
+  ```
 
-## Requisitos e instalação (requirements.txt)
+---
+
+## Arquitetura
+
+```
+Cliente ---> /reserve (Lua Redis) -----> Cria hold + reserved++
+        \                               \-> Evento em Stream (opcional)
+         \-> Pedido no PG --> /commit ----> UPDATE inventory.total (PG)
+                                        \-> RDI/CDC replica 'total' → Redis
+         \-> /release (Lua Redis) -----> reserved-- + DEL hold
+         \-> Reaper -------------------> libera holds expirados
+```
+
+**Componentes principais**:
+- **/reserve**: garante atomicamente que há estoque disponível, cria o hold e indexa em ZSET.  
+- **/commit**: decrementa o `inventory.total` no PG; o RDI replica para Redis; depois o hold é finalizado.  
+- **/release**: devolve reservas manualmente.  
+- **Reaper**: varre e libera automaticamente holds expirados (carrinho abandonado).  
+- **/extend**: permite estender prazo de um hold se o cliente ainda estiver ativo.  
+
+---
+
+## Por que é seguro
+
+- **Atomicidade**: cada operação é um único script Lua, sem interleaving.  
+- **Sem oversell**: reserva falha se `available < qty`.  
+- **Idempotência**: cada hold tem ID único (`cart_id:sku`), permitindo retries seguros.  
+- **Abandono tratado**: reaper garante liberação de estoque.  
+- **PG como SoR**: só o Postgres altera `inventory.total`; Redis nunca fica divergente porque o RDI replica.  
+- **Sem loops**: app não toca em `total`; RDI não toca em `reserved`/`hold:*`.  
+
+---
+
+## Setup local (venv + requirements)
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-cp .env.example .env  # edite credenciais
+
+cp .env.example .env   # configure PG_DSN e REDIS_URL
 set -a; source .env; set +a
+
 uvicorn app_rdi:app --reload
 ```
 
-## Variáveis (.env)
-Veja `.env.example`.
-- PG_DSN, REDIS_URL são obrigatórias.
+---
 
-## Rodando com Docker
-Crie o container:
+## Setup com Docker
+
+Build da imagem:
 ```bash
 docker build -t online-inventory-demo:latest .
 ```
 
-Execute com suas variáveis de conexão:
+Run com variáveis de conexão:
 ```bash
 docker run --rm -p 8000:8000 \
   -e PG_DSN="postgresql://USER:PASS@RDS_HOST:5432/DB?sslmode=require" \
@@ -44,9 +75,12 @@ docker run --rm -p 8000:8000 \
   online-inventory-demo:latest
 ```
 
-Observação: em Macs/Windows use `host.docker.internal` para falar com o Redis local; em Linux, mapear rede ou passar o IP do host.
+Observação: em Mac/Windows use `host.docker.internal` para conectar no Redis local; em Linux use IP do host ou compose.
+
+---
 
 ## Esquema PG mínimo
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 DO $$ BEGIN
@@ -90,7 +124,10 @@ INSERT INTO inventory (sku_id, total) VALUES
 ON CONFLICT (sku_id) DO NOTHING;
 ```
 
+---
+
 ## Testes rápidos (cURL)
+
 ```bash
 API="http://127.0.0.1:8000"
 
@@ -104,12 +141,12 @@ curl -s "$API/snapshot/sku-123" | jq
 curl -s "$API/events?limit=10" | jq
 ```
 
-## Observabilidade
-- Stream Redis opcional (`inv:events`) para auditar holds e commits.  
-- `snapshot/{sku}` mostra `total/reserved/available`.  
+---
 
-## Por que é seguro
-- Scripts Lua atômicos → sem interleaving.  
-- Idempotência por `holdId = cart_id:sku`.  
-- Reaper garante liberação em abandono de carrinho.  
-- Commit PG-first + RDI garante convergência PG↔Redis.
+## Observabilidade
+
+- **Stream Redis** opcional (`inv:events`) para auditar holds e commits.  
+- **`/snapshot/{sku}`** mostra `total/reserved/available` em tempo real.  
+
+---
+
