@@ -1,110 +1,94 @@
-# Demo de Reserva de Inventário Online (Redis + Postgres, sem CDC)
+# Demo de Reserva de Inventário Online (Redis + Postgres, com CDC/RDI)
 
-> Reservas lock-free e atômicas usando scripts Lua no Redis; o Postgres permanece como *system of record* (SoR) de pedidos e estoque final. Este README explica a arquitetura, setup, como o demo funciona, comandos de teste com `curl`, e como o Lua garante segurança e integridade.
+> Reservas lock-free e atômicas usando scripts Lua no Redis.  
+> O **Postgres** é o *system of record* (SoR) do estoque (`inventory.total`) e dos pedidos.  
+> O **RDI/CDC** replica automaticamente o campo `total` para o Redis (em `inv:{sku}.total`).  
+> O app gerencia apenas `reserved` e `hold:*` no Redis.  
+> Disponível = `total (PG/RDI)` – `reserved (Redis)`.
 
 ---
 
 ## Por que isso existe
 
-Em e-commerce é crítico garantir que, quando um comprador entra no checkout, realmente exista estoque disponível. Usar locks em banco ou locks distribuídos é lento e frágil.  
-Este demo usa **Redis** como fonte operacional da verdade (controle em tempo real do “pode vender agora?”) com **scripts Lua atômicos** (sem locks distribuídos) e o **Postgres** como fonte financeira/auditável (pedidos, relatórios).
+No e-commerce é crítico garantir que, quando o cliente entra no checkout, haja estoque para atender.  
+Locks em banco ou distribuídos são caros e frágeis.  
 
-- **Redis**: contadores ultra-rápidos e reservas de curta duração (**holds**) com prazos de expiração.
-- **Postgres**: pedidos e itens; Outbox ou CDC podem ser adicionados em produção para maior resiliência.
+Este design usa:
+- **Redis** → fonte operacional de verdade (quem decide “pode vender agora?”).  
+- **Postgres** → fonte financeira/auditável (pedidos, estoque consolidado).  
+- **RDI/CDC** → garante que `inventory.total` do PG seja refletido no Redis automaticamente.
 
 ---
 
 ## Arquitetura de alto nível
 
 ```
-Cliente ---> /reserve (Lua Redis) ------> Cria hold + incrementa reserved
-         \                               \-> Evento em Stream (opcional)
-          \-> Pedido no PG --> /commit ou /release (Lua Redis)
+Cliente ---> /reserve (Lua Redis) -----> Cria hold + reserved++
+        \                               \-> Evento em Stream (opcional)
+         \-> Pedido no PG --> /commit ----> UPDATE inventory.total (PG)
+                                        \-> RDI/CDC replica 'total' → Redis
+         \-> /release (Lua Redis) -----> reserved-- + DEL hold
+         \-> Reaper -------------------> libera holds expirados
 ```
 
-- **Reserve**: move unidades `available → reserved`, cria `hold:{cartId}:{sku}` com prazo de expiração.
-- **Commit**: remove o hold e decrementa `reserved` (estoque efetivamente consumido).
-- **Release/Expire**: devolve unidades `reserved → available`, deleta hold.
-- **Sem locks distribuídos**: cada passo é um único script Lua no Redis.
-
-### Modelo de autoridade
-
-- **Verdade operacional (disponibilidade)**: **Redis** (`reserved`, `holds` e cálculo de `available`).
-- **Verdade financeira (final)**: **Postgres** (`orders`, `inventory.total`).
-
-> Opcional: um Redis Stream (`inv:events`) registra `hold_created`, `hold_committed`, `hold_released` para auditoria.
+- **Reserve**: checa `available = total - reserved`, cria hold com prazo.  
+- **Commit**: decrementa `inventory.total` no PG; RDI replica no Redis. Depois, o hold é finalizado em Redis (`reserved -= qty`).  
+- **Release/Expire**: devolve estoque (reserved--, hold deletado).  
+- **Reaper**: garante que carrinhos abandonados liberem reservas.  
+- **Sem loops**: app nunca escreve `total` no Redis; RDI nunca toca `reserved`/`hold:*`.
 
 ---
 
-## Como o demo funciona
+## Como funciona
 
-1. **Seed inicial**
-   - No startup, o Redis recebe `inventory.total` do Postgres (via RDI/CDC).
-   - Campo `reserved` é inicializado como 0.
+1. **Seed inicial**  
+   - O Redis recebe `inventory.total` do PG via RDI.  
+   - `reserved=0` inicializado pelo app.
 
-2. **Fluxo de reserva**
-   - Cliente chama `/reserve {sku, qty, cart_id}`.
-   - Script Lua no Redis:
-     - Valida `available >= qty`.
-     - Atualiza `reserved` atômico.
-     - Cria `hold:{cart_id}:{sku}` com `expiresAt`.
-     - Indexa hold num ZSET (`holds:exp`) para reaper.
-     - Emite evento opcional.
+2. **Reserva** (`/reserve`)  
+   - Script Lua atômico valida `available >= qty`, atualiza `reserved`, cria hold com `expiresAt`, indexa no ZSET `holds:exp`.  
+   - Evento opcional em Stream.
 
-3. **Commit/Release**
-   - **Commit**: serviço primeiro decrementa `inventory.total` no PG; depois chama Lua para ajustar `reserved` e remover hold.
-   - **Release**: chama Lua para devolver reserva (`reserved -= qty`) e apagar hold.
+3. **Commit** (`/commit`)  
+   - Serviço lê o hold, tenta `UPDATE inventory.total = total - qty` no PG.  
+   - Se sucesso: RDI replica novo `total` → Redis. App roda `COMMIT_LUA` para `reserved--` e apagar hold.  
+   - Se falha (PG total insuficiente): app libera hold (`RELEASE_LUA`) e retorna erro 409.
 
-4. **Reaper de abandonos**
-   - Um loop periódico varre `holds:exp` e chama `RELEASE_LUA` para cada hold vencida.
-   - Isso garante que abandonos de carrinho liberam estoque corretamente.
+4. **Release manual** (`/release`)  
+   - Executa `RELEASE_LUA` → `reserved--` + DEL hold.  
+   - Não altera `total` no PG.
 
-5. **(Opcional) Outbox ou CDC**
-   - Não necessário para o demo.  
-   - Produção: Outbox (simples) ou CDC (mais infra, permite replay) podem ser usados para robustez.
+5. **Reaper**  
+   - Loop periódico varre `holds:exp`, chama `RELEASE_LUA` para holds vencidos.  
+   - Garante liberação automática de carrinhos abandonados.
+
+6. **Extend** (`/extend`)  
+   - Endpoint opcional para prorrogar prazo de um hold enquanto cliente está ativo.
 
 ---
 
-## Segurança e integridade: como o Lua garante
+## Segurança e integridade
 
-### Atomicidade
-Cada operação (reserve/commit/release) é um único script Lua → executa de ponta a ponta sem interleaving. Elimina condições de corrida.
-
-### Invariantes
+- **Atomicidade**: cada operação é um script Lua → indivisível.  
 - **Sem oversell**: reserva falha se `available < qty`.  
-- **Consistência**: reserve move sempre `available→reserved`; release devolve; commit só reduz `reserved`.  
-- **Abandono tratado**: holds têm `expiresAt` + reaper para auto-liberar.
-
-### Idempotência
-- **HoldId = cart_id:sku**.  
-- Repetir o mesmo reserve/commit/release é seguro:
-  - Reserve detecta hold já existente.  
-  - Commit/Release podem ser repetidos sem quebrar contadores.
-
-### Durabilidade & HA
-- **AOF** habilitado no Redis (`everysec` ou `always`).  
-- **Replicação/failover** (Sentinel, Redis Enterprise, ElastiCache Multi-AZ).  
-- **Cluster/sharding** para escalar.  
-
-### Recuperação
-- Redis reinicia e recarrega AOF.  
-- Em desastre, é possível **replay de pedidos do PG** (via CDC/outbox) aplicando os mesmos scripts idempotentes.
+- **Idempotência**: `holdId = cart_id:sku` → retries seguros.  
+- **Abandono coberto**: reaper sempre chama `RELEASE_LUA`.  
+- **SoR garantido**: `total` só muda no PG; RDI replica para Redis.  
+- **Sem loops**: app nunca mexe em `total` do Redis.
 
 ---
 
 ## Configuração
 
-Variáveis de ambiente ou constantes no topo do `app_rdi.py`.
-
 | Variável | Default | Propósito |
 |---|---|---|
 | `REDIS_URL` | `redis://localhost:6379/0` | Conexão Redis |
 | `PG_DSN` | `postgresql://postgres:postgres@localhost:5432/postgres` | Conexão PG |
-| `HOLD_TTL_SECONDS_DEFAULT` | `600` | Prazo padrão do hold (segundos) |
-| `ENABLE_EVENTS_STREAM` | `true` | Ativa logging em Stream Redis |
-| `EVENTS_STREAM_NAME` | `inv:events` | Nome do stream |
-| `REAPER_INTERVAL_SECS` | `1` | Intervalo do reaper |
-| `STRICT_UUID` | `true` | Validação de UUID em rotas (se usado) |
+| `HOLD_TTL_SECONDS_DEFAULT` | `600` | Prazo padrão do hold |
+| `REAPER_INTERVAL_SECS` | `1` | Intervalo de sweep do reaper |
+| `ENABLE_EVENTS_STREAM` | `true` | Liga Stream de eventos no Redis |
+| `EVENTS_STREAM_NAME` | `inv:events` | Nome do Stream |
+| `STRICT_UUID` | `true` | Validação de UUID |
 
 ---
 
@@ -114,15 +98,16 @@ Variáveis de ambiente ou constantes no topo do `app_rdi.py`.
 python -m venv .venv && source .venv/bin/activate
 pip install "fastapi>=0.111,<1" "uvicorn[standard]>=0.27,<1" "redis>=5,<6" "psycopg[binary]>=3.1,<4"
 
-# env
-export PG_DSN="postgresql://USER:PASS@RDS_HOST:5432/DB?sslmode=require"
+export PG_DSN="postgresql://USER:PASS@RDS:5432/DB?sslmode=require"
 export REDIS_URL="redis://localhost:6379/0"
 
-# run
 uvicorn app_rdi:app --reload
 ```
 
-### Esquema PG (mínimo)
+---
+
+## Esquema PG (mínimo)
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE TYPE order_status AS ENUM ('PENDING','CONFIRMED','CANCELLED');
@@ -178,17 +163,17 @@ curl -s -X POST "$API/release" -H 'content-type: application/json' \
 curl -s "$API/snapshot/sku-123" | jq
 ```
 
-### Eventos recentes
+### Eventos
 ```bash
 curl -s "$API/events?limit=10" | jq
 ```
 
 ---
 
-## Choices de design (por que é seguro)
+## Por que é seguro agora
 
-- **Lua atômico**: elimina race conditions.  
-- **Idempotência**: `holdId` garante retries seguros.  
-- **Lease+Reaper**: abandonos de carrinho sempre liberam estoque.  
-- **PG-first commit**: SoR nunca é bypassado; Redis é sincronizado via RDI.  
-- **Separation of concerns**: Redis → “pode vender agora”, PG → verdade final.  
+- **Redis decide disponibilidade** (`available = total - reserved`).  
+- **PG continua SoR** → commit só confirma se conseguiu decrementar `inventory.total`.  
+- **RDI garante convergência** entre PG e Redis.  
+- **Reaper** evita vazamentos de reserva em abandono.  
+- **Sem loops** entre sistemas.  
