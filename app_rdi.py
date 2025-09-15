@@ -39,8 +39,8 @@ def env_bool(name, default):
     if v is None: return default
     return v.lower() in ("1","true","t","yes","y","on")
 
-REDIS_URL = env_str("REDIS_URL", "redis://default:secret42@34.171.149.102:13000")
-PG_DSN    = env_str("PG_DSN",    "postgresql://postgres:Secret_42@gabs-rdi-cloud.c7glrswbovia.us-east-1.rds.amazonaws.com:5432/rdi_demo")
+REDIS_URL = env_str("REDIS_URL", "redis://default@rediscloud:13000")
+PG_DSN    = env_str("PG_DSN",    "postgresql://postgres:postgres@gabs-rdi-cloud.gsgsagsgasg.us-east-1.rds.amazonaws.com:5432/rdi_demo")
 
 def pg_connect(autocommit=False):
     return psycopg.connect(PG_DSN, row_factory=dict_row, autocommit=autocommit)

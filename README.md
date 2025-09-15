@@ -1,179 +1,115 @@
 # Demo de Reserva de Inventário Online (Redis + Postgres, com CDC/RDI)
 
-> Reservas lock-free e atômicas usando scripts Lua no Redis.  
-> O **Postgres** é o *system of record* (SoR) do estoque (`inventory.total`) e dos pedidos.  
-> O **RDI/CDC** replica automaticamente o campo `total` para o Redis (em `inv:{sku}.total`).  
-> O app gerencia apenas `reserved` e `hold:*` no Redis.  
-> Disponível = `total (PG/RDI)` – `reserved (Redis)`.
+Reservas lock-free e atômicas usando scripts Lua no Redis.  
+O Postgres é o *system of record* (SoR) do estoque (`inventory.total`) e dos pedidos.  
+O RDI/CDC replica automaticamente o campo `total` para o Redis (em `inv:{sku}.total`).  
+O app gerencia apenas `reserved` e `hold:*` no Redis.  
+Disponível = `total (PG/RDI)` – `reserved (Redis)`.
 
----
+## Como funciona (resumo)
+1) `/reserve`: script Lua valida `available = total - reserved`, cria hold com `expiresAt` e indexa no ZSET.  
+2) `/commit`: primeiro `UPDATE inventory.total` no PG; RDI replica `total` para Redis; então Lua faz `reserved--` e apaga o hold.  
+3) `/release`: Lua devolve `reserved--` e apaga hold.  
+4) Reaper: varre holds vencidos e chama release automático.  
+Sem loops: app nunca escreve `total` em Redis; RDI nunca toca `reserved`/`hold:*`.
 
-## Por que isso existe
-
-No e-commerce é crítico garantir que, quando o cliente entra no checkout, haja estoque para atender.  
-Locks em banco ou distribuídos são caros e frágeis.  
-
-Este design usa:
-- **Redis** → fonte operacional de verdade (quem decide “pode vender agora?”).  
-- **Postgres** → fonte financeira/auditável (pedidos, estoque consolidado).  
-- **RDI/CDC** → garante que `inventory.total` do PG seja refletido no Redis automaticamente.
-
----
-
-## Arquitetura de alto nível
-
-```
-Cliente ---> /reserve (Lua Redis) -----> Cria hold + reserved++
-        \                               \-> Evento em Stream (opcional)
-         \-> Pedido no PG --> /commit ----> UPDATE inventory.total (PG)
-                                        \-> RDI/CDC replica 'total' → Redis
-         \-> /release (Lua Redis) -----> reserved-- + DEL hold
-         \-> Reaper -------------------> libera holds expirados
-```
-
-- **Reserve**: checa `available = total - reserved`, cria hold com prazo.  
-- **Commit**: decrementa `inventory.total` no PG; RDI replica no Redis. Depois, o hold é finalizado em Redis (`reserved -= qty`).  
-- **Release/Expire**: devolve estoque (reserved--, hold deletado).  
-- **Reaper**: garante que carrinhos abandonados liberem reservas.  
-- **Sem loops**: app nunca escreve `total` no Redis; RDI nunca toca `reserved`/`hold:*`.
-
----
-
-## Como funciona
-
-1. **Seed inicial**  
-   - O Redis recebe `inventory.total` do PG via RDI.  
-   - `reserved=0` inicializado pelo app.
-
-2. **Reserva** (`/reserve`)  
-   - Script Lua atômico valida `available >= qty`, atualiza `reserved`, cria hold com `expiresAt`, indexa no ZSET `holds:exp`.  
-   - Evento opcional em Stream.
-
-3. **Commit** (`/commit`)  
-   - Serviço lê o hold, tenta `UPDATE inventory.total = total - qty` no PG.  
-   - Se sucesso: RDI replica novo `total` → Redis. App roda `COMMIT_LUA` para `reserved--` e apagar hold.  
-   - Se falha (PG total insuficiente): app libera hold (`RELEASE_LUA`) e retorna erro 409.
-
-4. **Release manual** (`/release`)  
-   - Executa `RELEASE_LUA` → `reserved--` + DEL hold.  
-   - Não altera `total` no PG.
-
-5. **Reaper**  
-   - Loop periódico varre `holds:exp`, chama `RELEASE_LUA` para holds vencidos.  
-   - Garante liberação automática de carrinhos abandonados.
-
-6. **Extend** (`/extend`)  
-   - Endpoint opcional para prorrogar prazo de um hold enquanto cliente está ativo.
-
----
-
-## Segurança e integridade
-
-- **Atomicidade**: cada operação é um script Lua → indivisível.  
-- **Sem oversell**: reserva falha se `available < qty`.  
-- **Idempotência**: `holdId = cart_id:sku` → retries seguros.  
-- **Abandono coberto**: reaper sempre chama `RELEASE_LUA`.  
-- **SoR garantido**: `total` só muda no PG; RDI replica para Redis.  
-- **Sem loops**: app nunca mexe em `total` do Redis.
-
----
-
-## Configuração
-
-| Variável | Default | Propósito |
-|---|---|---|
-| `REDIS_URL` | `redis://localhost:6379/0` | Conexão Redis |
-| `PG_DSN` | `postgresql://postgres:postgres@localhost:5432/postgres` | Conexão PG |
-| `HOLD_TTL_SECONDS_DEFAULT` | `600` | Prazo padrão do hold |
-| `REAPER_INTERVAL_SECS` | `1` | Intervalo de sweep do reaper |
-| `ENABLE_EVENTS_STREAM` | `true` | Liga Stream de eventos no Redis |
-| `EVENTS_STREAM_NAME` | `inv:events` | Nome do Stream |
-| `STRICT_UUID` | `true` | Validação de UUID |
-
----
-
-## Setup & run
-
+## Requisitos e instalação (requirements.txt)
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install "fastapi>=0.111,<1" "uvicorn[standard]>=0.27,<1" "redis>=5,<6" "psycopg[binary]>=3.1,<4"
-
-export PG_DSN="postgresql://USER:PASS@RDS:5432/DB?sslmode=require"
-export REDIS_URL="redis://localhost:6379/0"
-
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env  # edite credenciais
+set -a; source .env; set +a
 uvicorn app_rdi:app --reload
 ```
 
----
+## Variáveis (.env)
+Veja `.env.example`.
+- PG_DSN, REDIS_URL são obrigatórias.
 
-## Esquema PG (mínimo)
+## Rodando com Docker
+Crie o container:
+```bash
+docker build -t online-inventory-demo:latest .
+```
 
+Execute com suas variáveis de conexão:
+```bash
+docker run --rm -p 8000:8000 \
+  -e PG_DSN="postgresql://USER:PASS@RDS_HOST:5432/DB?sslmode=require" \
+  -e REDIS_URL="redis://host.docker.internal:6379/0" \
+  -e HOLD_TTL_SECONDS_DEFAULT=600 \
+  -e REAPER_INTERVAL_SECS=1 \
+  online-inventory-demo:latest
+```
+
+Observação: em Macs/Windows use `host.docker.internal` para falar com o Redis local; em Linux, mapear rede ou passar o IP do host.
+
+## Esquema PG mínimo
 ```sql
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-CREATE TYPE order_status AS ENUM ('PENDING','CONFIRMED','CANCELLED');
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'order_status') THEN
+    CREATE TYPE order_status AS ENUM ('PENDING','CONFIRMED','CANCELLED');
+  END IF;
+END$$;
 
-CREATE TABLE skus (
+CREATE TABLE IF NOT EXISTS skus (
   id   TEXT PRIMARY KEY,
   name TEXT NOT NULL
 );
 
-CREATE TABLE inventory (
-  sku_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS inventory (
+  sku_id TEXT PRIMARY KEY REFERENCES skus(id),
   total  INTEGER NOT NULL CHECK (total >= 0)
 );
 
-INSERT INTO skus (id,name) VALUES ('sku-123','Hydra Serum 30ml') ON CONFLICT DO NOTHING;
-INSERT INTO inventory (sku_id,total) VALUES ('sku-123',10) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS orders (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  cart_id    TEXT,
+  status     order_status NOT NULL DEFAULT 'PENDING',
+  created_at TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS order_items (
+  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  sku_id   TEXT NOT NULL REFERENCES skus(id),
+  qty      INTEGER NOT NULL CHECK (qty > 0),
+  PRIMARY KEY(order_id, sku_id)
+);
+
+INSERT INTO skus (id, name) VALUES
+  ('sku-123', 'Hydra Serum 30ml'),
+  ('sku-456', 'Hydra Serum 50ml')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO inventory (sku_id, total) VALUES
+  ('sku-123', 10),
+  ('sku-456', 5)
+ON CONFLICT (sku_id) DO NOTHING;
 ```
 
----
-
-## API quickstart (cURLs)
-
+## Testes rápidos (cURL)
 ```bash
 API="http://127.0.0.1:8000"
-```
 
-### Reservar
-```bash
 curl -s -X POST "$API/reserve" -H 'content-type: application/json' \
   -d '{"sku":"sku-123","qty":2,"cart_id":"cart-abc","ttl_seconds":120}' | jq
-```
 
-### Estender hold
-```bash
-curl -s -X POST "$API/extend" -H 'content-type: application/json' \
-  -d '{"cart_id":"cart-abc","sku":"sku-123","add_seconds":60}' | jq
-```
-
-### Commit
-```bash
 curl -s -X POST "$API/commit" -H 'content-type: application/json' \
   -d '{"cart_id":"cart-abc","sku":"sku-123"}' | jq
-```
 
-### Release manual
-```bash
-curl -s -X POST "$API/release" -H 'content-type: application/json' \
-  -d '{"cart_id":"cart-abc","sku":"sku-123"}' | jq
-```
-
-### Snapshot
-```bash
 curl -s "$API/snapshot/sku-123" | jq
-```
-
-### Eventos
-```bash
 curl -s "$API/events?limit=10" | jq
 ```
 
----
+## Observabilidade
+- Stream Redis opcional (`inv:events`) para auditar holds e commits.  
+- `snapshot/{sku}` mostra `total/reserved/available`.  
 
-## Por que é seguro agora
-
-- **Redis decide disponibilidade** (`available = total - reserved`).  
-- **PG continua SoR** → commit só confirma se conseguiu decrementar `inventory.total`.  
-- **RDI garante convergência** entre PG e Redis.  
-- **Reaper** evita vazamentos de reserva em abandono.  
-- **Sem loops** entre sistemas.  
+## Por que é seguro
+- Scripts Lua atômicos → sem interleaving.  
+- Idempotência por `holdId = cart_id:sku`.  
+- Reaper garante liberação em abandono de carrinho.  
+- Commit PG-first + RDI garante convergência PG↔Redis.
