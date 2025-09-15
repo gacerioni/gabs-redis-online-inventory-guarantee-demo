@@ -4,7 +4,7 @@ set -euo pipefail
 API="${API:-http://127.0.0.1:8000}"
 SKU="${SKU:-sku-123}"
 CART="${CART:-cart-happy}"
-QTY="${QTY:-100}"
+QTY="${QTY:-3}"
 TTL="${TTL:-120}"  # seconds
 
 echo "== Snapshot (before)"
